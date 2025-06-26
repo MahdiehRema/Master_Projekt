@@ -13,8 +13,8 @@ import decimal
 from tqdm import tqdm  
 import math
 today = date.today() 
-vault_path="vtdwh/datalab"
-conn1 = bro.db.build_engine("vtdwh/datalab")
+vault_path="vwh/dlab"
+conn1 = bro.db.build_engine("vh/dalab")
 conn2= bro.database.build_oracle_connection_by_vault(vault_path, handle_lob=False)
 
 
