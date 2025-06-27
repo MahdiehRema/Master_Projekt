@@ -1,0 +1,78 @@
+%pip install pvd_modules 
+%pip install cx_Oracle
+import oracledb
+import pandas as pd
+import data_bro as bro
+import pvd_modules as pvd
+import polars as pl
+from datetime import date, timedelta
+import hashlib
+from sqlalchemy.dialects import oracle
+from sqlalchemy import Column, Float
+import decimal
+from tqdm import tqdm  
+import math
+today = date.today() 
+vault_path="vh/lab"
+conn1 = bro.db.build_engine("vh/dab")
+conn2= bro.database.build_oracle_connection_by_vault(vault_path, handle_lob=False)
+
+
+df_data= pvd.util.read_origin_per_polars("pvd_determined")
+init_historisierung = df_data.select([
+        "PVID",
+        "EMAIL",
+        "STATUS",
+        "TRASSENABSTANDSKATEGORIE_OWN",
+        "P1_TEL_TYP",
+        "P1_TEL_PING_ERGEBNIS",
+        "P1_TEL_PING_DATUM",
+        "MASTER_MARKETABLE",
+        "FLAG_BESTANDSKUNDE",
+        "FLAG_BLACKLIST",
+        "ENTFL_ADDRESS",
+        "FLAG_PUBLIC",
+    ])
+columns_to_hash = [
+    "PVID",
+    "EMAIL",
+    "STATUS",
+    "TRASSENABSTANDSKATEGORIE_OWN",
+    "P1_TEL_TYP",
+    "P1_TEL_PING_ERGEBNIS",
+    "P1_TEL_PING_DATUM",
+    "MASTER_MARKETABLE",
+    "FLAG_BESTANDSKUNDE",
+    "FLAG_BLACKLIST",
+    "ENTFL_ADDRESS",
+    "FLAG_PUBLIC",
+]
+del df_data
+def row_hash_sha256(row_dict):
+    row_string = "|".join([str(v) if v is not None else "" for v in row_dict.values()])
+    return hashlib.sha256(row_string.encode("utf-8")).hexdigest()
+init_historisierung = init_historisierung.with_columns([pl.lit(today).alias("GÜLTIG_AB"),
+                                              pl.lit(None, dtype=pl.Date).alias("GÜLTIG_BIS"),
+                                              pl.struct(columns_to_hash).map_elements(row_hash_sha256).alias("HASH_KEY")])
+chunk_size = 200_000  
+total_rows = init_historisierung.height
+
+for i in range(0, total_rows, chunk_size):
+    print(f"Verarbeite Zeilen {i} bis {min(i + chunk_size, total_rows)}")
+
+  
+    chunk_pl = init_historisierung.slice(i, chunk_size)
+
+ 
+    chunk_pd = chunk_pl.to_pandas()
+
+    # 3. Optional: Fehlende Werte konvertieren
+    chunk_pd = chunk_pd.where(pd.notna(chunk_pd), None)
+
+  
+    bro.db.push_database(
+            df=chunk_pd,
+            table="HISTORISIERUNG",
+            if_exists="append",
+            conn="vh/dlab",
+        )
