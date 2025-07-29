@@ -1,183 +1,178 @@
-%pip install pvd_modules 
-%pip install cx_Oracle
-import oracledb
-import pandas as pd
-import data_bro as bro
-import pvd_modules as pvd
-import polars as pl
-from datetime import date, timedelta
 import hashlib
-from sqlalchemy.dialects import oracle
-from sqlalchemy import Column, Float
-import decimal
-from tqdm import tqdm  
-import math
-today = date.today() 
-vault_path="vwh/dlab"
-conn1 = bro.db.build_engine("vh/dalab")
-conn2= bro.database.build_oracle_connection_by_vault(vault_path, handle_lob=False)
+import sqlalchemy
+import polars as pl
+from .config import (
+    chunk_size,
+    infer_schema_length,
+    now,
+    before_one_min,
+    columns_to_hash,
+    final_column_order,
+)
+from ..util import read_origin_per_polars
+from ..util import engine_oracle
 
 
-def _row_hash_sha256(row_dict):
-        row_string = "|".join([str(v) if v is not None else "" for v in row_dict.values()])
-        return hashlib.sha256(row_string.encode("utf-8")).hexdigest()
+def _row_hash_sha256(row):
+    values = [str(v) if v is not None else "NULL" for v in row.values()]
+    concat_str = "|DM_NULL_SEPERATOR|".join(values)
+    return hashlib.sha256(concat_str.encode("utf-8")).hexdigest()
 
 
-def extract_ht() -> pl.DataFrame :
+def _write_polars_in_chunks(df: pl.DataFrame, table_name: str):
+    for i in range(0, df.height, chunk_size):
+        chunk = df.slice(i, chunk_size)
+        chunk.write_database(
+            table_name, connection=engine_oracle(), if_table_exists="append"
+        )
+
+
+def extract_ht_old() -> pl.DataFrame:
     """Die Historisierungs-Tabelle wird aus der Oracle-Datenbank stückweise eingelesen.
-     :param df: None
-     :returns: df_HT als pl.Dataframe
+
+    :param df: None
+    :returns: df_HT als pl.Dataframe
     """
-    cursor = conn2.cursor()
-    cursor.execute("SELECT * FROM HISTORISIERUNG where GÜLTIG_BIS IS NULL ")
-    chunk_size = 200_000
-    all_chunks = []
-    columns = [col[0] for col in cursor.description]
-    while True:
-        rows = cursor.fetchmany(chunk_size)
-        if not rows:
-        break
-        pd_df = pd.DataFrame(rows, columns=columns)
-        pl_df = pl.from_pandas(pd_df)
-        pl_df = pl_df.with_columns([pl.col("P1_TEL_PING_DATUM").cast(pl.Datetime("ns")).alias("P1_TEL_PING_DATUM"),
-                                pl.col("GÜLTIG_AB").cast(pl.Datetime("ns")).dt.date().alias("GÜLTIG_AB"),
-                                pl.col("GÜLTIG_BIS").cast(pl.Datetime("ns")).dt.date().alias("GÜLTIG_BIS"),
-                                pl.col("P1_TEL_PING_ERGEBNIS").cast(pl.Float64, strict=False)])
-        all_chunks.append(pl_df)
-        
-    df_HT= pl.concat(all_chunks)
-    df_HT = df_DM.with_columns([pl.col("GÜLTIG_AB").cast(pl.Date).alias("GÜLTIG_AB")])
-    df_HT = df_DM.with_columns([pl.col("P1_TEL_PING_DATUM").cast(pl.Date).alias("P1_TEL_PING_DATUM")])
-    df_HT = df_DM.with_columns([pl.col("GÜLTIG_BIS").cast(pl.Date).alias("GÜLTIG_BIS")])
+    query_HT = "select * from PVD_HISTORISIERUNG where GÜLTIG_BIS is null"
+    df_HT = pl.read_database(
+        query_HT,
+        connection=engine_oracle(),
+        batch_size=chunk_size,
+        infer_schema_length=infer_schema_length,
+    )
+    df_HT = df_HT.with_columns(
+        [
+            pl.col("P1_TEL_PING_DATUM")
+            .cast(pl.Datetime("ns"))
+            .alias("P1_TEL_PING_DATUM"),
+            pl.col("GÜLTIG_AB").cast(pl.Datetime("ns")).dt.date().alias("GÜLTIG_AB"),
+            pl.col("GÜLTIG_BIS").cast(pl.Datetime("ns")).dt.date().alias("GÜLTIG_BIS"),
+            pl.col("P1_TEL_PING_ERGEBNIS").cast(pl.Float64, strict=False),
+        ]
+    )
     return df_HT
 
-        
-def extract_pvd() -> pl.DataFrame :
-    """Importiert PVD-Daten und extrahiert die relevanten Spalten.
-       :param df: None
-       :returns: df_PVD als pl.Dataframe
-      """
-    df_data= pvd.util.read_origin_per_polars("pvd_determined")
-    df_PVD = df_data.select([
-        "PVID",
-        "EMAIL",
-        "STATUS",
-        "TRASSENABSTANDSKATEGORIE_OWN",
-        "P1_TEL_TYP",
-        "P1_TEL_PING_ERGEBNIS",
-        "P1_TEL_PING_DATUM",
-        "MASTER_MARKETABLE",
-        "FLAG_BESTANDSKUNDE",
-        "FLAG_BLACKLIST",
-        "ENTFL_ADDRESS",
-        "FLAG_PUBLIC"
-    ])
+
+def extract_pvd() -> pl.DataFrame:
+    """Importiert PVD-Daten und extrahiert die relevanten Spalten für Vergleich.
+
+    :param df: None
+    :returns: df_PVD als pl.Dataframe
+    """
+    df_data = read_origin_per_polars("pvd_determined")
+    df_PVD = (df_data.select(columns_to_hash))
+
+    df_PVD = df_PVD.with_columns(
+        pl.struct(columns_to_hash).map_elements(_row_hash_sha256).alias("HASH_KEY")
+    )
     del df_data
-    df_PVD = df_PVD.with_columns([pl.col("P1_TEL_PING_DATUM").cast(pl.Date).alias("P1_TEL_PING_DATUM")])
+    df_PVD = df_PVD.with_columns(
+        [
+            pl.col("P1_TEL_PING_DATUM").cast(pl.Datetime("ns")),
+            pl.col("P1_TEL_PING_ERGEBNIS").cast(pl.Float64, strict=False),
+        ]
+    )
+
     return df_PVD
 
 
-def delta_detection(df_HT: pl.DataFrame ,df_PVD: pl.DataFrame) -> pl.DataFrame:
-     """ PVD und Historisierung werden miteinander verglichen. Eine Änderung liegt vor, 
-         wenn Werte in PVD geändert wurden, eine neue PVID hinzugefügt wurde oder 
-         eine bestehende PVID abgelaufen ist.
-         
-        :param: df_HT als pl.Dataframe & df_PVD als pl.Dataframe
-        :returns: HT_Änderung als pl.Dataframe & PVD_Änderung als pl.Dataframe
-      """
-    columns_to_compare = ['EMAIL','STATUS','TRASSENABSTANDSKATEGORIE_OWN',
-                          'P1_TEL_TYP','P1_TEL_PING_ERGEBNIS','P1_TEL_PING_DATUM',
-                          'MASTER_MARKETABLE','FLAG_BESTANDSKUNDE','FLAG_BLACKLIST',
-                          'ENTFL_ADDRESS','FLAG_PUBLIC']
-    df_ht_renamed = df_HT.rename({col: f"{col}_old" for col in columns_to_compare})
-    df_pvd_renamed = df_PVD.rename({col: f"{col}_new" for col in columns_to_compare})
-    df_joined = df_ht_renamed.join(df_pvd_renamed, on="PVID", how="inner")
-    STR_NULL = "-999"
-    Date_NULL = "-888"
-    string_cols = [name for name, dtype in zip(df_joined.columns, df_joined.dtypes) if dtype == pl.Utf8]
-    date_cols = [name for name, dtype in zip(df_joined.columns, df_joined.dtypes) if dtype == pl.Date]
-    for column in string_cols:
-    df_joined = df_joined.with_columns(
-        pl.when(pl.col(column).is_null())
-        .then(pl.lit(STR_NULL))
-        .otherwise(pl.col(column))
-        .alias(column))
-    for column in date_cols:
-    df_joined = df_joined.with_columns(
-        pl.when(pl.col(column).is_null())
-        .then(pl.lit(Date_NULL))
-        .otherwise(pl.col(column))
-        .alias(column))
-    condition = None
-    for col in columns_to_compare:
-        col_old = pl.col(f"{col}_old")
-        col_new = pl.col(f"{col}_new")
-        expr = col_old != col_new
-        condition = expr if condition is None else (condition | expr)
-    changed_PVID = df_joined.filter(condition).select("PVID")
-    df_ht_changed_rows = df_HT.filter(pl.col("PVID").is_in(changed_PVID))
-    df_pvd_changed_rows = df_PVD.filter(pl.col("PVID").is_in(changed_PVID))
-    neu_PVID = df_PVD.join(df_HT, on="PVID", how="anti")
-    alt_PVID = df_HT.join(df_PVD, on="PVID", how="anti")
-    HT_Änderung=pl.concat([df_ht_changed_rows,alt_PVID])
-    PVD_Änderung=pl.concat([df_pvd_changed_rows,neu_PVID])
-    return HT_Änderung,PVD_Änderung 
+def insert_chaneged_pvd(df_PVD: pl.DataFrame, df_HT: pl.DataFrame) -> pl.DataFrame:
+    """wird geänderte Datensätze aus PVD in Oracle geschrieben.
+
+    :Param df: df_PVD als pl.DataFrame, df_HT als pl.DataFrame
+    :return: None
+    """
+
+    df_new_pvids = df_PVD.join(df_HT, on="HASH_KEY", how="anti")
+    df_new_pvids = df_new_pvids.with_columns(
+        pl.lit(now).alias("GÜLTIG_AB"), pl.lit(None).alias("GÜLTIG_BIS")
+    )
+    df_new_pvids = df_new_pvids.select(final_column_order)
+    _write_polars_in_chunks(df_new_pvids, "PVD_HISTORISIERUNG")
+    return None
 
 
-def update_chaneged_ht(HT_Änderung: pl.DataFrame):
-     """Abgelaufene PVIDs und geänderte Datensätze in der Historisierung-Tabelle werden aktualisiert, 
-        indem das Feld ‚Gültig bis‘ auf das heutige Datum gesetzt wird.
-        
-        :param: HT_Änderung als pl.Dataframe
-        :returns: None
-        """
-    df_hashkeys = HT_Änderung.select("HASH_KEY").to_pandas()
-    df_hashkeys["HASH_KEY"] = df_hashkeys["HASH_KEY"].astype(str)
-    bro.db.push_database(df=df_hashkeys, table="TEMP_HASH_KEYS",if_exists="replace",conn="vtdwh/datalab")
-    query1= f"""  UPDATE HISTORISIERUNG h
-                SET GÜLTIG_BIS = TRUNC(SYSDATE)
-                WHERE EXISTS (
-                SELECT 1
-                FROM TEMP_HASH_KEYS tmp
-                WHERE tmp.HASH_KEY = h.HASH_KEY
+def update_chaneged_ht():
+    """geänderte Datensätze in der Historisierung-Tabelle werden aktualisiert,
+    indem das Feld ‚Gültig bis‘ auf das now gesetzt wird.
+
+    :param: None
+    :returns: None
+    """
+    with engine_oracle().begin() as conn:
+        conn.execute(
+            sqlalchemy.text(
+                """
+                UPDATE PVD_HISTORISIERUNG
+                SET GÜLTIG_BIS = :before_one_min
+                WHERE 
+                    GÜLTIG_BIS IS NULL 
+                    AND HASH_KEY IN (
+                        SELECT t.HASH_KEY
+                        FROM PVD_HISTORISIERUNG t
+                        JOIN (
+                            SELECT PVID, MAX(GÜLTIG_AB) AS max_gueltig_ab
+                            FROM PVD_HISTORISIERUNG
+                            GROUP BY PVID
+                        ) latest
+                          ON t.PVID = latest.PVID
+                         AND t.GÜLTIG_AB < latest.max_gueltig_ab
                 )
-                          """
-    bro.db.exec_query(query1,bro.db.build_engine("vtdwh/datalab").connect())
+                """
+            ),
+            {"before_one_min": before_one_min},
+        )
     return None
-    
-       
-def insert_chaneged_pvd(PVD_Änderung: pl.DataFrame):
-     """Für die PVD-Änderung werden drei Spalten erstellt: ‚Gültig ab‘, ‚Gültig bis‘ und ‚HashKey‘.
-        Der HashKeys werden durch eine Hilffunktion dabei generiert.
-        Diese Spalten werden durch ‘gültig ab [heutiges Datum]’ und ‘gültig bis None’ ersetzt.
-        Weiterhin wird die PVD_Änderung in die Historisierungstabelle eingefügt.
-        
-        :param: PVD_Änderung als pl.Dataframe
-        :returns: None
-      """
-    columns_to_hash = ["PVID","EMAIL","STATUS","TRASSENABSTANDSKATEGORIE_OWN",
-                       "P1_TEL_TYP","P1_TEL_PING_ERGEBNIS","P1_TEL_PING_DATUM",
-                       "MASTER_MARKETABLE","FLAG_BESTANDSKUNDE","FLAG_BLACKLIST",
-                       "ENTFL_ADDRESS","FLAG_PUBLIC"]
-    updated_PVD_Änderung=PVD_Änderung.with_columns([pl.lit(today).alias("GÜLTIG_AB"),
-                                                  pl.lit(None,dtype=pl.Date).alias("GÜLTIG_BIS"),
-                                                  pl.struct(columns_to_hash).map_elements(row_hash_sha256, return_dtype=pl.Utf8).alias("HASH_KEY")])
-    updated_PVD_Änderung=updated_PVD_Änderung.to_pandas()
-    bro.db.push_database(df=updated_PVD_Änderung, table="HISTORISIERUNG",if_exists="append",conn="vtdwh/datalab")
+
+
+def update_gelöschte_pvid(df_HT: pl.DataFrame, df_PVD: pl.DataFrame) -> None:
+    """
+    Findet abgelaufene PVIDs und schließt sie in der Datenbank.
+
+    :param df_PVD: Polars DataFrame mit aktuellen PVIDs
+    :param df_HT: Polars DataFrame mit historisierten PVIDs
+    :returns: None
+    """
+    with engine_oracle().begin() as conn:
+        conn.execute(sqlalchemy.text(f"""TRUNCATE TABLE TEMP_PVD_HASH_KEY"""))
+
+    zuschlissende_hash_key = df_HT.join(df_PVD, on="PVID", how="anti").select(
+        "HASH_KEY"
+    )
+    zuschlissende_hash_key.write_database(
+        "cdip_out.temp_pvd_hash_key",
+        connection=engine_oracle(),
+        if_table_exists="append",
+    )
+    with engine_oracle().begin() as conn:
+        conn.execute(
+            sqlalchemy.text(
+                """
+                UPDATE PVD_HISTORISIERUNG ph
+                SET GÜLTIG_BIS = :before_one_min
+                WHERE HASH_KEY IN (
+                    SELECT HASH_KEY
+                    FROM TEMP_PVD_HASH_KEY tmp
+                    WHERE tmp.HASH_KEY = ph.HASH_KEY
+                )
+                """
+            ),
+            {"before_one_min": before_one_min},
+        )
+
     return None
-    
-    
+
+
 def löschroutine_ht():
-     """ Die Historisierungstabelle wird bereinigt, 
-         indem Datensätze, die älter als ein Jahr sind, gelöscht werden.
-         
-         :param: None
-         :returns: None
-      """
-    query2=""" DELETE FROM HISTORISIERUNG 
+    """Die Historisierungstabelle wird bereinigt,
+    indem Datensätze, die älter als ein Jahr sind, gelöscht werden.
+
+    :param: None
+    :returns: None
+    """
+    lösch_query = """ DELETE FROM PVD_HISTORISIERUNG 
                WHERE GÜLTIG_BIS <= SYSDATE - 365 """
-    bro.db.exec_query(query2,bro.db.build_engine("vtdwh/datalab").connect())
+    with engine_oracle().begin() as conn:
+        conn.execute(sqlalchemy.text(lösch_query))
+
     return None
-    
-    
-    
