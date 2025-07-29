@@ -7,39 +7,14 @@ import pvd_modules as pvd
 import polars as pl
 from datetime import date, timedelta
 import hashlib
-from sqlalchemy.dialects import oracle
-from sqlalchemy import Column, Float
-import decimal
-from tqdm import tqdm  
-import math
+
 
 today = date.today() 
 vault_path="vh/daab"
-conn1 = bro.db.build_engine("vh/daab")
-conn2= bro.database.build_oracle_connection_by_vault(vault_path, handle_lob=False)
-cursor = conn2.cursor()
-cursor.execute("SELECT * FROM HISTORISIERUNG where GÜLTIG_BIS IS NULL ")
-chunk_size = 200_000
-all_chunks = [] 
-columns = [col[0] for col in cursor.description]
 
-while True:
-    rows = cursor.fetchmany(chunk_size)
-    if not rows:
-        break
-    pd_df = pd.DataFrame(rows, columns=columns)
-    pl_df = pl.from_pandas(pd_df)
-    pl_df = pl_df.with_columns([
-    pl.col("P1_TEL_PING_DATUM").cast(pl.Datetime("ms")),
-    ])
-    all_chunks.append(pl_df)
+query_HT= "select * from PVD_HISTORISIERUNG where GÜLTIG_BIS is null"
+df_HT = pl.read_database(query_HT, connection=conn.connect())
 
-    print(f"Chunk mit {len(rows)} Zeilen geladen")
-
-df_HT= pl.concat(all_chunks)
-df_HT = df_HT.with_columns([pl.col("GÜLTIG_AB").cast(pl.Date).alias("GÜLTIG_AB")])
-df_HT = df_HT.with_columns([pl.col("P1_TEL_PING_DATUM").cast(pl.Date).alias("P1_TEL_PING_DATUM")])
-df_HT = df_HT.with_columns([pl.col("GÜLTIG_BIS").cast(pl.Date).alias("GÜLTIG_BIS")])
 def create_dim_col(df: pl.DataFrame, col: str, dim_name: str):
    
     dim = df.select(col).unique()
@@ -51,9 +26,7 @@ def create_dim_col(df: pl.DataFrame, col: str, dim_name: str):
         if_exists="replace",
         conn="vwh/daab"               
     )
-
     return dim_pd
-
 
 def create_dim_cols(df: pl.DataFrame, cols: list, dim_name: str):
         dim = df.select(cols).unique()
@@ -69,46 +42,53 @@ def create_dim_cols(df: pl.DataFrame, cols: list, dim_name: str):
 
 def create_dim_date(start_date:str, end_date:str):
     dates = pd.date_range(start=start_date, end=end_date, freq="D")
-    
     dim_date = pd.DataFrame()
     dim_date["datum"] = dates
     dim_date["datum_id"] = dim_date["datum"].dt.strftime("%Y%m%d").astype(int)
-    
     dim_date["jahr"] = dim_date["datum"].dt.year
     dim_date["monat"] = dim_date["datum"].dt.month
     dim_date["tag"] = dim_date["datum"].dt.day
     dim_date["wochentag"] = dim_date["datum"].dt.day_name()
     dim_date["ist_wochenende"] = dim_date["wochentag"].isin(["Samstag", "Sonntag"])
-
-    # Optional: Als String anzeigen
     dim_date["ist_wochenende"] = dim_date["ist_wochenende"].replace({True: "Ja", False: "Nein"})
-    bro.db.push_database(df=dim_date, table="dim_date", if_exists="replace",conn="vtdwh/datalab")
+    bro.db.push_database(df=dim_date, table="dim_date", if_exists="replace",conn="vwh/dab")
     return dim_date
+
 dim_date=create_dim_date("2025-01-01","2045-12-31")
 dim_date=pl.from_pandas(dim_date)
 dim_date = dim_date.with_columns(pl.col("datum").cast(pl.Date))
+
 dim_kunde= create_dim_cols(df_HT, ["PVID","EMAIL"], "kunde")
 dim_kunde=pl.from_pandas(dim_kunde)
+
 dim_ping= create_dim_cols(df_HT, ["P1_TEL_PING_ERGEBNIS","P1_TEL_PING_DATUM"], "ping")
 dim_ping=pl.from_pandas(dim_ping)
+
 dim_tel= create_dim_col(df_HT, "P1_TEL_TYP", "tel")
 dim_tel=pl.from_pandas(dim_tel)
+
 dim_entfadresse= create_dim_col(df_HT,"ENTFL_ADDRESS", "entfadresse")
 dim_entfadresse=pl.from_pandas(dim_entfadresse)
+
 dim_trassen= create_dim_col(df_HT, "TRASSENABSTANDSKATEGORIE_OWN", "trassen")
 dim_trassen=pl.from_pandas(dim_trassen)
+
 df1 = df_HT.join(dim_entfadresse, on="ENTFL_ADDRESS", how="left")
 df2 = df1.join(dim_tel, on="P1_TEL_TYP", how="left")
 df3 = df2.join(dim_trassen, on="TRASSENABSTANDSKATEGORIE_OWN", how="left")
 dim_ping = dim_ping.with_columns(pl.col("P1_TEL_PING_DATUM").cast(pl.Date))
 df4= df3.join(dim_ping, on=["P1_TEL_PING_ERGEBNIS", "P1_TEL_PING_DATUM"], how="left")
+
 fact_df=df4["HASH_KEY", "PVID","STATUS","GÜLTIG_AB", "GÜLTIG_BIS",
         "ENTFADRESSE_ID", "TEL_ID", "TRASSEN_ID", "PING_ID",
         "MASTER_MARKETABLE", "FLAG_BESTANDSKUNDE", "FLAG_BLACKLIST","FLAG_PUBLIC"]
-fact_df = fact_df.with_columns([
-    pl.col("GÜLTIG_AB").dt.strftime("%Y%m%d").cast(pl.Int32).alias("GÜLTIG_AB_ID"),
-    pl.col("GÜLTIG_BIS").dt.strftime("%Y%m%d").cast(pl.Int32).alias("GÜLTIG_BIS_ID"),
-])
+
+fact_df = fact_df.with_columns([pl.col("GÜLTIG_AB").dt.strftime("%Y%m%d").cast(pl.Int32).alias("GÜLTIG_AB_ID")])
+fact_df = fact_df.with_columns([pl.when(pl.col("GÜLTIG_BIS").is_not_null())
+                               .then(pl.col("GÜLTIG_BIS").cast(pl.Datetime("ns")).dt.strftime("%Y%m%d").cast(pl.Int32))
+                               .otherwise(None)
+                               .alias("GÜLTIG_BIS_ID")])
+
 
 fact_df=fact_df.to_pandas()
 bro.db.push_database(df=fact_df, table="FACT_HT",if_exists="replace",conn="vwh/dab",)
